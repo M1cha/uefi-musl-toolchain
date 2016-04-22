@@ -42,3 +42,12 @@ $DIR/lib/start.a
 
 
 EOF
+
+mkdir -p $DIR/bin
+cat <<EOF > $DIR/bin/arm-uefi-gcc
+#!/bin/sh
+exec "\${REALGCC:-arm-linux-gnueabi-gcc}" "\$@" -specs "$DIR/uefi-musl-gcc.specs"
+
+EOF
+
+chmod +x $DIR/bin/arm-uefi-gcc

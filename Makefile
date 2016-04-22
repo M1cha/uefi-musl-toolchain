@@ -55,7 +55,7 @@ package: start kernelheaders
 	
 	# misc
 	mkdir -p $(PACKAGE_OUT)/misc
-	cp generate-specs.sh $(PACKAGE_OUT)/
+	cp prepare.sh $(PACKAGE_OUT)/
 	cp GccBase.lds $(PACKAGE_OUT)/misc/
 
 clean:
