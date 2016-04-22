@@ -19,10 +19,10 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPRINTF_LONG_SUPPORT")
 # includes
 set(INCLUDES
     ${CMAKE_SOURCE_DIR}/include
+    ${MUSL_INSTALL}/include
 
-	/media/Data/repositories/git/efidroid/out/target/common/arm/uefiapp_StdlibTest/MdePkg/Include
-	/media/Data/repositories/git/efidroid/out/target/common/arm/uefiapp_StdlibTest/MdePkg/Include/Arm
-    /tmp/musl/include
+	${EDK2_DIR}/MdePkg/Include
+	${EDK2_DIR}/MdePkg/Include/Arm
 )
 
 # library
