@@ -57,6 +57,11 @@ package: start kernelheaders
 	mkdir -p $(PACKAGE_OUT)/misc
 	cp prepare.sh $(PACKAGE_OUT)/
 	cp GccBase.lds $(PACKAGE_OUT)/misc/
+	
+	# misc
+	mkdir -p $(PACKAGE_OUT)/bin
+	cp prebuilts/GenFw $(PACKAGE_OUT)/bin/
+	cp elf2efi $(PACKAGE_OUT)/bin/
 
 clean:
 	rm -Rf $(PWD)/out

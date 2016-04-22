@@ -1,0 +1,2 @@
+#!/bin/sh
+GenFw -e UEFI_APPLICATION -o "$1.efi" "$1"
