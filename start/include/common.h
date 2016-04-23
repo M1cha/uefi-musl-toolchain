@@ -20,6 +20,8 @@
 // UEFI
 #include <Base.h>
 #include <Uefi.h>
+#include <PiDxe.h>
+#include <Library/HobLib.h>
 #undef NULL
 
 // STDLIB
@@ -28,12 +30,20 @@
 #include <sys/uio.h>
 #include <sys/auxv.h>
 #include <sys/prctl.h>
+#include <sys/utsname.h>
+#include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <syscall.h>
 #include <stdarg.h>
 #include <setjmp.h>
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <poll.h>
+#include <limits.h>
+#include <malloc.h>
 
 // PRIVATE
 #include "syscalls.h"
@@ -50,6 +60,12 @@ extern EFI_HANDLE gImageHandle;
 extern EFI_SYSTEM_TABLE* gST;
 extern EFI_RUNTIME_SERVICES* gRT;
 extern EFI_BOOT_SERVICES* gBS;
+extern void* stack_base;
+extern size_t stack_size;
+extern void* stack_copy;
+
+int setjmp_stack (jmp_buf);
+_Noreturn void longjmp_stack (jmp_buf, int);
 
 void __syscall_init(void);
 

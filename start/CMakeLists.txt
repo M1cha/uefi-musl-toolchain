@@ -1,6 +1,6 @@
 # project setup
 cmake_minimum_required(VERSION 2.8) 
-project(uefitoolchain)
+project(uefitoolchain C ASM)
 set(CMAKE_BUILD_TYPE Release)
 
 # cflags
@@ -27,5 +27,8 @@ add_library(start STATIC
     src/entry.c
     src/syscalls.c
     src/printf.c
+
+    src/arm/setjmp_stack.s
+    src/arm/longjmp_stack.s
 )
 set_property(TARGET start PROPERTY INCLUDE_DIRECTORIES ${INCLUDES})

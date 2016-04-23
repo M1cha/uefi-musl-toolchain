@@ -12,6 +12,14 @@ EFI_HANDLE gImageHandle;
 EFI_SYSTEM_TABLE* gST;
 EFI_RUNTIME_SERVICES* gRT;
 EFI_BOOT_SERVICES* gBS;
+static EFI_HOB_MEMORY_ALLOCATION_STACK* mStackHob = NULL;
+void* stack_base;
+size_t stack_size;
+void* stack_copy;
+
+static void* mHobList = NULL;
+static EFI_GUID gEfiHobListGuid = { 0x7739F24C, 0x93D7, 0x11D4, { 0x9A, 0x3A, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D }};
+static EFI_GUID gEfiHobMemoryAllocStackGuid = { 0x4ED4BF27, 0x4092, 0x42E9, { 0x80, 0x7D, 0x52, 0x7B, 0x1D, 0x00, 0xC9, 0xBD }};
 
 VOID *
 InternalAllocatePool (
@@ -60,6 +68,74 @@ static void internal_putc (unused void* p, char c) {
     gST->ConOut->OutputString(gST->ConOut, (uint16_t*)buf);
 }
 
+BOOLEAN
+EFIAPI
+CompareGuid (
+  IN CONST GUID  *Guid1,
+  IN CONST GUID  *Guid2
+  )
+{
+  return (memcmp(Guid1, Guid2, sizeof(GUID)) == 0) ? TRUE : FALSE;
+}
+
+EFI_STATUS
+EFIAPI
+EfiGetSystemConfigurationTable (
+  IN  EFI_GUID  *TableGuid,
+  OUT VOID      **Table
+  )
+{
+  EFI_SYSTEM_TABLE  *SystemTable;
+  UINTN             Index;
+
+  SystemTable = gST;
+  *Table = NULL;
+  for (Index = 0; Index < SystemTable->NumberOfTableEntries; Index++) {
+    if (CompareGuid (TableGuid, &(SystemTable->ConfigurationTable[Index].VendorGuid))) {
+      *Table = SystemTable->ConfigurationTable[Index].VendorTable;
+      return EFI_SUCCESS;
+    }
+  }
+
+  return EFI_NOT_FOUND;
+}
+
+VOID *
+EFIAPI
+GetNextHob (
+  IN UINT16                 Type,
+  IN CONST VOID             *HobStart
+  )
+{
+  EFI_PEI_HOB_POINTERS  Hob;
+   
+  Hob.Raw = (UINT8 *) HobStart;
+  //
+  // Parse the HOB list until end of list or matching type is found.
+  //
+  while (!END_OF_HOB_LIST (Hob)) {
+    if (Hob.Header->HobType == Type) {
+      return Hob.Raw;
+    }
+    Hob.Raw = GET_NEXT_HOB (Hob);
+  }
+  return NULL;
+}
+
+EFI_HOB_MEMORY_ALLOCATION_STACK* GetStackHob(void) {
+  EFI_PEI_HOB_POINTERS           Hob;
+
+  Hob.Raw = mHobList;
+  while ((Hob.Raw = GetNextHob (EFI_HOB_TYPE_MEMORY_ALLOCATION, Hob.Raw)) != NULL) {
+    if (CompareGuid (&gEfiHobMemoryAllocStackGuid, &(Hob.MemoryAllocationStack->AllocDescriptor.Name))) {
+      return Hob.MemoryAllocationStack;
+    }
+    Hob.Raw = GET_NEXT_HOB (Hob);
+  }
+
+  return NULL;
+}
+
 EFI_STATUS
 EFIAPI
 _ModuleEntryPoint (
@@ -73,6 +149,7 @@ _ModuleEntryPoint (
     UINTN num_auxs = 0;
     CONST CHAR8* program_name = "/usr/bin/fake";
     UINTN tmpsz;
+    EFI_STATUS Status;
 
     gImageHandle = ImageHandle;
     gST = SystemTable;
@@ -81,6 +158,25 @@ _ModuleEntryPoint (
 
     uefi_init_printf(NULL, internal_putc);
     uefi_printf("entry\n");
+
+    // get hob list
+    Status = EfiGetSystemConfigurationTable (&gEfiHobListGuid, &mHobList);
+    if(EFI_ERROR(Status)) {
+        uefi_printf("can't get efi hob list\n");
+        return Status;
+    }
+
+    // get stack hob
+    mStackHob = GetStackHob();
+    if(mStackHob==NULL) {
+        uefi_printf("can't get stack hob\n");
+        return EFI_SUCCESS;
+    }
+
+    // get stack information and allocate copy buffer
+    stack_base = (void*)(UINTN)mStackHob->AllocDescriptor.MemoryBaseAddress;
+    stack_size = (UINTN)mStackHob->AllocDescriptor.MemoryLength;
+    stack_copy = AllocateZeroPool(stack_size);
 
     __syscall_init();
 
