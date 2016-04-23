@@ -11,17 +11,11 @@ cat <<EOF > $DIR/uefi-musl-gcc.specs
 *cc1:
 %(cc1_cpu) -ffreestanding -mword-relocations -nostdinc -isystem $DIR/include -isystem include%s
 
-*link_gcc_c_sequence:
---start-group %G %L --end-group
-
 *link_libgcc:
-
+-L$DIR/lib -L .%s
 
 *libgcc:
 libgcc.a%s %:if-exists(libgcc_eh.a%s)
-
-*lib:
-$DIR/lib/libc.a
 
 *startfile:
 $DIR/lib/start.a
@@ -30,7 +24,7 @@ $DIR/lib/start.a
 
 
 *link:
--nostdlib --emit-relocs --script=$DIR/misc/GccBase.lds --defsym=PECOFF_HEADER_SIZE=0x220 --entry=_ModuleEntryPoint
+-nostdlib --emit-relocs %{shared:-shared} %{static:-static} --script=$DIR/misc/GccBase.lds --defsym=PECOFF_HEADER_SIZE=0x220 --entry=_ModuleEntryPoint
 
 *esp_link:
 
@@ -47,7 +41,18 @@ mkdir -p $DIR/bin
 cat <<EOF > $DIR/bin/arm-uefi-gcc
 #!/bin/sh
 exec "\${REALGCC:-arm-linux-gnueabi-gcc}" "\$@" -specs "$DIR/uefi-musl-gcc.specs"
-
 EOF
-
 chmod +x $DIR/bin/arm-uefi-gcc
+
+genforward() {
+cat <<EOF > $DIR/bin/arm-uefi-$1
+#!/bin/sh
+exec "\${REALGCC:-arm-linux-gnueabi-$1}" "\$@"
+EOF
+chmod +x $DIR/bin/arm-uefi-$1
+}
+
+genforward ar
+genforward strip
+
+
