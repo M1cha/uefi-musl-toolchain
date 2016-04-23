@@ -1,6 +1,8 @@
 [submodule "external/musl"]
 	path = external/musl
 	url = https://github.com/M1cha/musl.git
+	branch = master
 [submodule "external/kernel-headers"]
 	path = external/kernel-headers
 	url = https://github.com/sabotage-linux/kernel-headers.git
+	branch = master
