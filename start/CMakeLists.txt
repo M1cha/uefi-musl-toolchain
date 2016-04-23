@@ -10,9 +10,6 @@ set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -nostdlib -nostdinc -ffreestanding -fno-buil
 set(CMAKE_C_FLAGS_RELEASE "-Os")
 set(CMAKE_C_FLAGS_DEBUG  "-g")
 
-# musl endian.h
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-error=parentheses")
-
 # printf
 set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -DPRINTF_LONG_SUPPORT")
 
