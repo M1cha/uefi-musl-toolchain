@@ -33,6 +33,7 @@
 #include <sys/utsname.h>
 #include <sys/ioctl.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <syscall.h>
 #include <stdarg.h>
 #include <setjmp.h>

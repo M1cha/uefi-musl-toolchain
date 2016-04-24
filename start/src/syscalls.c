@@ -3,9 +3,13 @@
 #define MAX_SYSCALL 2048
 #define register_syscall(name) sys_call_table[SYS_##name] = sys_##name;
 
+struct std_fd;
+struct std_file;
+
 static void* sys_call_table[MAX_SYSCALL] = {0};
 static list_node_t processes;
 static process_t* current_process = NULL;
+static struct std_file* filesystem;
 
 static struct utsname utsname = {
 	.sysname = "UEFI",
@@ -20,27 +24,37 @@ static struct utsname utsname = {
 #endif
 };
 
-struct fd_handler;
+// file functions
+typedef ssize_t (*io_fn_t)(struct std_file*, char __user *, size_t);
+typedef long (*ioctl_fn_t)(struct std_file*, unsigned int, unsigned long);
+typedef void (*destroy_fn_t)(struct std_file*);
 
-typedef ssize_t (*io_fn_t)(struct fd_handler*, char __user *, size_t);
-typedef long (*ioctl_fn_t)(struct fd_handler*, unsigned int, unsigned long);
-typedef void (*close_fn_t)(struct fd_handler*);
-typedef int (*copy_fn_t)(struct fd_handler*,struct fd_handler*);
-
-struct fd_handler {
+struct std_file {
+    // node info
     list_node_t node;
+    char* name;
+    list_node_t children;
+    struct stat stat;
+    struct std_file* parentfile;
 
-    unsigned long fd;
+    // operations
     io_fn_t read;
     io_fn_t write;
     ioctl_fn_t ioctl;
 
-    close_fn_t close;
-    copy_fn_t copy;
-
+    // private data
+    destroy_fn_t destroy;
     void* private;
 };
-typedef struct fd_handler fd_handler_t;
+typedef struct std_file std_file_t;
+
+struct std_fd {
+    list_node_t node;
+    unsigned long fd;
+    unsigned long flags;
+    std_file_t* file;
+};
+typedef struct std_fd std_fd_t;
 
 typedef struct {
     int real_type;
@@ -49,9 +63,122 @@ typedef struct {
 } fd_tty_pdata_t;
 
 long sys_close(unsigned int fd);
-static int init_tty(fd_handler_t* fdhandler, int realfd);
+static int init_tty(std_file_t* file, int realfd);
 static process_t* create_process(process_t* parent, int pid);
 static void remove_process(process_t* p);
+
+static std_file_t* get_file_by_path(const char* path, ssize_t maxlen) {
+    uint32_t pos;
+    uint32_t pos_start;
+    char buf[PATH_MAX+1];
+
+    if(!path || path[0]=='\0')
+        return filesystem;
+
+    if(path[0]=='/')
+        path++;
+
+    if(path[0]=='\0')
+        return filesystem;
+
+    //uefi_printf("parse: [%s] len=%d\n", path, maxlen);
+
+    // we have a path relative to root now
+    
+    std_file_t* file = filesystem;
+    pos_start = 0;
+    uint32_t len = maxlen>=0?(size_t)maxlen:strlen(path);
+    for(pos=0; pos<len; pos++) {
+        bool is_end = pos==len-1;
+        char c = path[pos];
+
+        if(c=='\0' || c=='/' || is_end) {
+            uint32_t part_len = pos-pos_start;
+            if(is_end && c!='\0' && c!='/') part_len++;
+
+            memcpy(buf, &path[pos_start], part_len);
+            buf[part_len] = '\0';
+
+            if(buf[0]!='\0' && strcmp(buf, ".")) {
+                if(!strcmp(buf, "..")) {
+                    if(!file->parentfile || !S_ISDIR(file->parentfile->stat.st_mode)) return NULL;
+                    file = file->parentfile;
+                }
+
+                else {
+                    bool found_file = false;
+                    std_file_t *entry;
+                    list_for_every_entry(&file->children, entry, std_file_t, node) {
+                        if(!strcmp(buf, entry->name)) {
+                            file = entry;
+                            found_file = true;
+                            break;
+                        }
+                    }
+
+                    if(!found_file) return NULL;
+                }
+            }
+
+            pos_start = pos+1;
+        }
+    }
+
+    return file;
+}
+
+static std_file_t* new_file(const char* path) {
+    std_file_t* parentfile = NULL;
+    char* name = NULL;
+
+    if(path!=NULL) {
+        // make path relative to root
+        UEFI_ASSERT(path[0]!='\0');
+        if(path[0]=='/')
+            path++;
+        UEFI_ASSERT(path[0]!='\0');
+
+        uint32_t last_slash = 0;
+        //uint32_t pathlen = strlen(path);
+        uint32_t pos;
+
+        for(pos=0; pos<strlen(path); pos++) {
+            if(path[pos]=='/')
+                last_slash = pos;
+        }
+
+        if(last_slash==0)
+            parentfile=filesystem;
+        else
+            parentfile = get_file_by_path(path, last_slash);
+
+        if(!parentfile) return NULL;
+
+        name = strdup(&path[last_slash?last_slash+1:0]);
+    }
+
+    // allocate
+    std_file_t* file = AllocateZeroPool(sizeof(std_file_t));
+    UEFI_ASSERT(file);
+
+    // set info
+    list_initialize(&file->children);
+
+    // this is the root node
+    if(path==NULL) {
+        filesystem = file;
+    }
+
+    else {
+        file->name = name;
+        file->parentfile = parentfile;
+
+        // add file to parent's children
+        list_add_tail(&parentfile->children, &(file->node));
+    }
+
+    return file;
+}
 
 int get_unused_fd(void) {
     unsigned int fd = 0;
@@ -59,8 +186,8 @@ int get_unused_fd(void) {
     UEFI_ASSERT(current_process);
 
     // get fd handler
-    fd_handler_t *entry;
-    list_for_every_entry(&(current_process->fds), entry, fd_handler_t, node) {
+    std_fd_t *entry;
+    list_for_every_entry(&(current_process->fds), entry, std_fd_t, node) {
         if(entry->fd>=fd) {
             fd = entry->fd+1;
         }
@@ -83,22 +210,21 @@ int get_unused_pid(void) {
     return pid;
 }
 
-static fd_handler_t* get_file(unsigned int fd) {
+static std_fd_t* get_stdfd(unsigned int fd) {
     UEFI_ASSERT(current_process);
 
-    fd_handler_t *entry;
-    list_for_every_entry(&(current_process->fds), entry, fd_handler_t, node) {
+    std_fd_t *entry;
+    list_for_every_entry(&(current_process->fds), entry, std_fd_t, node) {
         if(entry->fd==fd) {
             return entry;
         }
     }
 
-    //uefi_printf("FD %d not found\n", fd);
     return NULL;
 }
 
 
-static ssize_t do_loop_readv_writev(fd_handler_t *fdhandler, struct iovec *iov,
+static ssize_t do_loop_readv_writev(std_file_t *file, struct iovec *iov,
 		unsigned long nr_segs, io_fn_t fn)
 {
 	struct iovec *vector = iov;
@@ -114,7 +240,7 @@ static ssize_t do_loop_readv_writev(fd_handler_t *fdhandler, struct iovec *iov,
 		vector++;
 		nr_segs--;
 
-		nr = fn(fdhandler, base, len);
+		nr = fn(file, base, len);
 
 		if (nr < 0) {
 			if (!ret)
@@ -129,10 +255,10 @@ static ssize_t do_loop_readv_writev(fd_handler_t *fdhandler, struct iovec *iov,
 	return ret;
 }
 
-static ssize_t tty_write(fd_handler_t* fdhandler, char __user * buf, size_t len) {
+static ssize_t tty_write(std_file_t* file, char __user * buf, size_t len) {
     size_t i;
     uint8_t c[4] = {0};
-    fd_tty_pdata_t* pdata = fdhandler->private;
+    fd_tty_pdata_t* pdata = file->private;
 
     UEFI_ASSERT(pdata);
 
@@ -158,8 +284,8 @@ static ssize_t tty_write(fd_handler_t* fdhandler, char __user * buf, size_t len)
     return (ssize_t)len;
 }
 
-static ssize_t tty_read(unused fd_handler_t* fdhandler, char __user * buf, unused size_t len) {
-    fd_tty_pdata_t* pdata = fdhandler->private;
+static ssize_t tty_read(std_file_t* file, char __user * buf, size_t len) {
+    fd_tty_pdata_t* pdata = file->private;
     UINTN           WaitIndex;
     EFI_INPUT_KEY   Key;
 
@@ -175,26 +301,31 @@ static ssize_t tty_read(unused fd_handler_t* fdhandler, char __user * buf, unuse
     if(pdata->real_type!=0)
         return -EIO;
 
-    // wait for key
-    EFI_STATUS Status = gBS->WaitForEvent (1, &gST->ConIn->WaitForKey, &WaitIndex);
-    if(EFI_ERROR (Status))
-        return -1;
+    for(;;) {
+        // wait for key
+        EFI_STATUS Status = gBS->WaitForEvent (1, &gST->ConIn->WaitForKey, &WaitIndex);
+        if(EFI_ERROR (Status))
+            return -EIO;
 
-    // read key
-    Status = gST->ConIn->ReadKeyStroke (gST->ConIn, &Key);
-    if(EFI_ERROR(Status) || Key.ScanCode!=SCAN_NULL) {
-        return 0;
+        // read key
+        Status = gST->ConIn->ReadKeyStroke (gST->ConIn, &Key);
+        if(EFI_ERROR(Status)) {
+            return -EIO;
+        }
+
+        if(Key.ScanCode==SCAN_NULL) {
+            buf[0] = Key.UnicodeChar;
+            if (buf[0] == '\r')
+                buf[0] = '\n';
+            break;
+        }
     }
-
-    buf[0] = Key.UnicodeChar;
-    if (buf[0] == '\r')
-        buf[0] = '\n';
 
     return 1;
 }
 
-static long tty_ioctl(fd_handler_t* fdhandler, unsigned int cmd, unsigned long arg) {
-    fd_tty_pdata_t* pdata = fdhandler->private;
+static long tty_ioctl(std_file_t* file, unsigned int cmd, unsigned long arg) {
+    fd_tty_pdata_t* pdata = file->private;
 
     UEFI_ASSERT(pdata);
 
@@ -218,23 +349,10 @@ static long tty_ioctl(fd_handler_t* fdhandler, unsigned int cmd, unsigned long a
     }
 }
 
-static void tty_close(fd_handler_t* fdhandler) {
-    UEFI_ASSERT(fdhandler->private);
+static void tty_destroy(std_file_t* file) {
+    UEFI_ASSERT(file->private);
 
-    gBS->FreePool(fdhandler->private);
-}
-
-static int tty_copy(fd_handler_t* dst, fd_handler_t* src) {
-    UEFI_ASSERT(dst);
-    UEFI_ASSERT(src);
-
-    init_tty(dst, 0);
-
-    UEFI_ASSERT(dst->private);
-    UEFI_ASSERT(src->private);
-
-    memcpy(dst->private, src->private, sizeof(fd_tty_pdata_t));
-    return 0;
+    gBS->FreePool(file->private);
 }
 
 SYSCALL_DEFINE1(settls, long, val) {
@@ -273,17 +391,19 @@ SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr) {
 
 SYSCALL_DEFINE3(ioctl, unused unsigned int, fd, unused unsigned int, cmd, unused unsigned long, arg) {
     long rc = -EIO;
-    fd_handler_t *fdhandler = get_file(fd);
 
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    if(fdhandler->ioctl) {
-	    rc = fdhandler->ioctl(fdhandler, cmd, arg);
+    std_file_t* file = stdfd->file;
+
+    if(file->ioctl) {
+	    rc = stdfd->file->ioctl(file, cmd, arg);
     }
 
     if(rc)   
-        uefi_printf("invalid ioctl %x on %d\n", cmd, fdhandler->fd);
+        uefi_printf("invalid ioctl %x on %d\n", cmd, stdfd->fd);
 
     return rc;
 }
@@ -291,70 +411,73 @@ SYSCALL_DEFINE3(ioctl, unused unsigned int, fd, unused unsigned int, cmd, unused
 SYSCALL_DEFINE3(writev, unsigned long, fd, struct iovec __user *, vec,
 		unsigned long, vlen)
 {
-	fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    if(!fdhandler->write) {
+    std_file_t* file = stdfd->file;
+
+    if(!file->write) {
         return -EIO;
     }
 
     if(!vec)
         return -EFAULT;
     
-	return do_loop_readv_writev(fdhandler, (void*)vec, vlen, fdhandler->write);
+	return do_loop_readv_writev(file, (void*)vec, vlen, file->write);
 }
 
 SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
 		size_t, count)
 {
-	fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    if(!fdhandler->write) {
+    std_file_t* file = stdfd->file;
+
+    if(!file->write) {
         return -EIO;
     }
 
     if(!buf)
         return -EFAULT;
 
-    //uefi_printf("%s(%ld, 0x%x, %ld)\n", __func__, fd, buf, count);
-	return fdhandler->write(fdhandler, (void*)buf, count);
+	return file->write(file, (void*)buf, count);
 }
 
 SYSCALL_DEFINE3(readv, unsigned long, fd, const struct iovec __user *, vec,
 		unsigned long, vlen)
 {
-    fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    if(!fdhandler->read) {
+    std_file_t* file = stdfd->file;
+
+    if(!file->read) {
         return -EIO;
     }
 
     if(!vec)
         return -EFAULT;
     
-	return do_loop_readv_writev(fdhandler, (void*)vec, vlen, fdhandler->read);
+	return do_loop_readv_writev(file, (void*)vec, vlen, file->read);
 }
 
 SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 {
-	fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    if(!fdhandler->read) {
+    std_file_t* file = stdfd->file;
+
+    if(!file->read) {
         return -EIO;
     }
 
-	return fdhandler->read(fdhandler, (void*)buf, count);
+	return file->read(file, (void*)buf, count);
 }
 
 SYSCALL_DEFINE0(getpid) {
@@ -472,46 +595,51 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unused unsigned long, a
 
 SYSCALL_DEFINE3(open, unused const char __user *, filename, unused int, flags, unused mode_t, mode)
 {
-    //uefi_printf("open(%s, %d, %d)\n", filename, flags, mode);
-	return -ENOENT;
-}
-
-SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
-{
     UEFI_ASSERT(current_process);
 
-	fd_handler_t *fdhandler_old = get_file(oldfd);
-	fd_handler_t *fdhandler_new = get_file(newfd);
+    //uefi_printf("open(%s, %d, %d)\n", filename, flags, mode);
+    // get file
+    std_file_t* file = get_file_by_path(filename, -1);
+    if(!file)
+        return -ENOENT;
 
-    if(!fdhandler_old) {
+    // allocate
+    std_fd_t* nfd = AllocateZeroPool(sizeof(std_fd_t));
+    if(!nfd) return -ENOMEM;
+
+    // set data
+    nfd->fd = get_unused_fd();
+    nfd->flags = flags;
+    nfd->file = file;
+
+    // add new fd to list
+    list_add_tail(&(current_process->fds), &(nfd->node));
+
+	return nfd->fd;
+}
+
+SYSCALL_DEFINE3(dup3, unsigned int, oldfd, unsigned int, newfd, int, flags) {
+    UEFI_ASSERT(current_process);
+
+	std_fd_t *stdfd_old = get_stdfd(oldfd);
+	std_fd_t *stdfd_new = get_stdfd(newfd);
+
+    if(!stdfd_old) {
         return -EBADF;
     }
 
     // allocate
-    fd_handler_t* nfd = AllocateZeroPool(sizeof(fd_handler_t));
+    std_fd_t* nfd = AllocateZeroPool(sizeof(std_fd_t));
     if(!nfd) return -ENOMEM;
 
     // copy all data
-    memcpy(nfd, fdhandler_old, sizeof(*nfd));
-    nfd->node.magic = 0;
-    nfd->node.next = 0;
-    nfd->node.prev = 0;
-
-    // set new fd
     nfd->fd = newfd;
-
-    // call dup handler
-    if(nfd->copy) {
-        if(nfd->copy(nfd, fdhandler_old)) {
-            gBS->FreePool(nfd);
-            return -EIO;
-        }
-    }
+    nfd->flags = flags;
+    nfd->file = stdfd_old->file;
 
     // close old 'newfd' in case it does already exist
-    if(fdhandler_new) {
+    if(stdfd_new) {
         if(sys_close(newfd)) {
-            // XXX: private data leak
             gBS->FreePool(nfd);
             return -EIO;
         }
@@ -521,6 +649,15 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
     list_add_tail(&(current_process->fds), &(nfd->node));
 
     return nfd->fd;
+}
+
+SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd) {
+	std_fd_t *stdfd_old = get_stdfd(oldfd);
+    return sys_dup3(oldfd, newfd, stdfd_old->flags);
+}
+
+SYSCALL_DEFINE1(dup, unsigned int, fildes) {
+    return sys_dup2(fildes, get_unused_fd());
 }
 
 SYSCALL_DEFINE2(getgroups32, int, gidsetsize, unused gid_t __user *, grouplist)
@@ -571,37 +708,34 @@ SYSCALL_DEFINE1(uname, struct utsname __user *, name)
 }
 
 SYSCALL_DEFINE1(close, unsigned int, fd) {
-    fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
-    
-    if(fdhandler->close)
-        fdhandler->close(fdhandler);
+    //std_file_t* file = stdfd->file;
+    // XXX: do a flush?
 
-    list_delete(&(fdhandler->node));
-    gBS->FreePool(fdhandler);
+    list_delete(&(stdfd->node));
+    gBS->FreePool(stdfd);
 
     return 0;
 }
 
-static int init_tty(fd_handler_t* fdhandler, int realfd) {
-    UEFI_ASSERT(fdhandler);
+static int init_tty(std_file_t* file, int realfd) {
+    UEFI_ASSERT(file);
 
     fd_tty_pdata_t* pdata = AllocateZeroPool(sizeof(fd_tty_pdata_t));
     UEFI_ASSERT(pdata);
-    fdhandler->private = pdata;
+    file->private = pdata;
 
     pdata->real_type = realfd;
     pdata->winsz.ws_row = 25;
     pdata->winsz.ws_col = 80;
 
-    fdhandler->ioctl = tty_ioctl;
-    fdhandler->close = tty_close;
-    fdhandler->copy = tty_copy;
-    fdhandler->read = tty_read;
-    fdhandler->write = tty_write;
+    file->ioctl = tty_ioctl;
+    file->read = tty_read;
+    file->write = tty_write;
+    file->destroy = tty_destroy;
 
     return 0;
 }
@@ -609,9 +743,8 @@ static int init_tty(fd_handler_t* fdhandler, int realfd) {
 SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
 		unused unsigned long, arg)
 {
-    fd_handler_t *fdhandler = get_file(fd);
-
-    if(!fdhandler) {
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
         return -EBADF;
     }
 
@@ -720,47 +853,18 @@ static process_t* create_process(process_t* parent, int pid) {
     p->process_dumpable = 1;
     snprintf(p->cwd, PATH_MAX, "/");
 
-    if(parent==NULL) {
-        fd_handler_t* fdstdin = AllocateZeroPool(sizeof(fd_handler_t));
-        UEFI_ASSERT(fdstdin);
-        init_tty(fdstdin, 0);
-        fdstdin->fd = 0;
-        list_add_tail(&(p->fds), &(fdstdin->node));
-
-        fd_handler_t* fdstdout = AllocateZeroPool(sizeof(fd_handler_t));
-        UEFI_ASSERT(fdstdout);
-        init_tty(fdstdout, 1);
-        fdstdout->fd = 1;
-        list_add_tail(&(p->fds), &(fdstdout->node));
-
-        fd_handler_t* fdstderr = AllocateZeroPool(sizeof(fd_handler_t));
-        UEFI_ASSERT(fdstderr);
-        init_tty(fdstderr, 2);
-        fdstderr->fd = 2;
-        list_add_tail(&(p->fds), &(fdstderr->node));
-    }
-
-    else {
-        fd_handler_t *entry;
-        list_for_every_entry(&(parent->fds), entry, fd_handler_t, node) {
+    if(parent!=NULL) {
+        std_fd_t *entry;
+        list_for_every_entry(&(parent->fds), entry, std_fd_t, node) {
 
             // allocate
-            fd_handler_t* nfd = AllocateZeroPool(sizeof(fd_handler_t));
+            std_fd_t* nfd = AllocateZeroPool(sizeof(std_fd_t));
             UEFI_ASSERT(nfd);
 
             // copy all data
-            memcpy(nfd, entry, sizeof(*nfd));
-            nfd->node.magic = 0;
-            nfd->node.next = 0;
-            nfd->node.prev = 0;
-
-            // call dup handler
-            if(nfd->copy) {
-                if(nfd->copy(nfd, entry)) {
-                    gBS->FreePool(nfd);
-                    return NULL;
-                }
-            }
+            nfd->fd = entry->fd;
+            nfd->flags = entry->flags;
+            nfd->file = entry->file;
 
             // add new fd to list
             list_add_tail(&(p->fds), &(nfd->node));
@@ -776,17 +880,23 @@ static void remove_process(process_t* p) {
     UEFI_ASSERT(p);
 
     while(!list_is_empty(&(p->fds))) {
-        fd_handler_t* fdhandler = list_remove_tail_type(&(p->fds), fd_handler_t, node);
-        UEFI_ASSERT(fdhandler);
+        std_fd_t* stdfd = list_peek_tail_type(&(p->fds), std_fd_t, node);
+        UEFI_ASSERT(stdfd);
 
-        if(fdhandler->close) {
-            fdhandler->close(fdhandler);
-        }
-        gBS->FreePool(fdhandler);
+        // close
+        sys_close(stdfd->fd);
     }
 
     list_delete(&(p->node));
     gBS->FreePool(p);
+}
+
+static ssize_t null_write(unused std_file_t* file, unused char __user * buf, size_t len) {
+    return len;
+}
+
+static ssize_t null_read(unused std_file_t* file, unused char __user * buf, unused size_t len) {
+    return 0;
 }
 
 process_t* __syscall_init(void) {
@@ -814,7 +924,9 @@ process_t* __syscall_init(void) {
     register_syscall(clock_gettime);
     register_syscall(prctl);
     register_syscall(open);
+    register_syscall(dup3);
     register_syscall(dup2);
+    register_syscall(dup);
     register_syscall(getgroups32);
     register_syscall(getcwd);
     register_syscall(chdir);
@@ -832,9 +944,37 @@ process_t* __syscall_init(void) {
     snprintf(utsname.version, 65, "EDK II-0x%08x"/*, gST->FirmwareVendor*/, gST->FirmwareRevision);
 
     list_initialize(&processes);
+    filesystem = new_file(NULL);
+    filesystem->stat.st_mode = S_IFDIR;
+
+    std_file_t* file = new_file("/dev");
+    UEFI_ASSERT(file);
+    file->stat.st_mode = S_IFDIR;
+
+    file = new_file("/dev/null");
+    UEFI_ASSERT(file);
+    file->read = null_read;
+    file->write = null_write;
+
+    std_file_t* fstdin = new_file("/dev/stdin");
+    UEFI_ASSERT(fstdin);
+    init_tty(fstdin, 0);
+
+    std_file_t* fstdout = new_file("/dev/stdout");
+    UEFI_ASSERT(fstdout);
+    init_tty(fstdout, 1);
+
+    std_file_t* fstderr = new_file("/dev/stderr");
+    UEFI_ASSERT(fstderr);
+    init_tty(fstderr, 2);
 
     process_t* p = create_process(NULL, 1);
     current_process = p;
+
+    sys_open("/dev/stdin", 0, 0);
+    sys_open("/dev/stdout", 0, 0);
+    sys_open("/dev/stderr", 0, 0);
+
     return p;
 }
 

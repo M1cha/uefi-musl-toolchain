@@ -194,9 +194,15 @@ _ModuleEntryPoint (
     // get stack information and allocate copy buffer
     stack_base = (void*)(UINTN)mStackHob->AllocDescriptor.MemoryBaseAddress;
     stack_size = (UINTN)mStackHob->AllocDescriptor.MemoryLength;
-    stack_copy = AllocateZeroPool(stack_size);
 
-    __syscall_init();
+    UEFI_ASSERT(stack_base);
+    UEFI_ASSERT(stack_size);
+
+    process_t* rootprocess = __syscall_init();
+    if(!rootprocess) {
+        uefi_printf("can't create root process\n");
+        return EFI_SUCCESS;
+    }
 
     // allocate data pointer
     UINTN phdr_len = ROUNDUP(sizeof(UINTN) * (1 + num_args+1 + num_envs+1) + sizeof(Elf_auxv_t) * num_auxs+1, 16);
