@@ -45,14 +45,47 @@
 #include <limits.h>
 #include <malloc.h>
 
+#define ROUNDUP(a, b) (((a) + ((b)-1)) & ~((b)-1))
+#define unused __attribute__((unused))
+
+void uefi_do_assert (const char* filename, size_t lineno, const char* exp);
+#define _UEFI_ASSERT(Expression)  uefi_do_assert (__FILE__, __LINE__, #Expression)
+#define UEFI_ASSERT(Expression)        \
+do {                            \
+    if (!(Expression)) {        \
+      _UEFI_ASSERT (Expression);     \
+    }                           \
+} while (0)
+
 // PRIVATE
 #include "syscalls.h"
 #include "list.h"
 
-#define ROUNDUP(a, b) (((a) + ((b)-1)) & ~((b)-1))
-#define unused __attribute__((unused))
-
 typedef Elf32_auxv_t Elf_auxv_t;
+
+typedef struct {
+    list_node_t node;
+
+    int pid;
+    int tid;
+    int ppid;
+    list_node_t fds;
+    int process_dumpable;
+    char cwd[PATH_MAX+1];
+
+    // exit
+    jmp_buf return_jmpbuf;
+    int exit_code;
+    void* stack_backup;
+
+    // threads
+    int __user* clear_child_tid;
+    long tls ;
+
+    // fork
+    //int has_vfork_status;
+    //int vfork_status;
+} process_t;
 
 extern jmp_buf __exit_jmpbuf;
 extern int __exit_code;
@@ -64,13 +97,11 @@ extern void* stack_base;
 extern size_t stack_size;
 extern void* stack_copy;
 
-int setjmp_stack (jmp_buf);
-_Noreturn void longjmp_stack (jmp_buf, int);
+int setjmp_stack (jmp_buf, void* stack_backup);
+_Noreturn void longjmp_stack (jmp_buf, int, void* stack_backup);
 
-void __syscall_init(void);
-
+process_t* __syscall_init(void);
 void uefi_init_printf(void *putp, void (*putf) (void *, char));
-
 void uefi_printf(const char *fmt, ...);
 
 VOID *

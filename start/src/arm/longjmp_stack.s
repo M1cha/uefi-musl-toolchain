@@ -4,8 +4,7 @@
 longjmp_stack:
 
     // src
-    ldr r4, =stack_copy
-    ldr r4, [r4]
+    mov r4, r2
     // dst
     ldr r5, =stack_base
     ldr r5, [r5]

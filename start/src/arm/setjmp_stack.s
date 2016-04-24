@@ -8,8 +8,7 @@ setjmp_stack:
     ldr r4, =stack_base
     ldr r4, [r4]
     // dst
-    ldr r5, =stack_copy
-    ldr r5, [r5]
+    mov r5, r1
     // src+len
     ldr r6, =stack_size
     ldr r6, [r6]

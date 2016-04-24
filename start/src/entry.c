@@ -6,20 +6,25 @@ void _fini() __attribute__((weak));
 _Noreturn int __libc_start_main(int (*)(), int, char **,
 	void (*)(), void(*)(), void(*)());
 
-jmp_buf __exit_jmpbuf;
 int __exit_code;
 EFI_HANDLE gImageHandle;
 EFI_SYSTEM_TABLE* gST;
 EFI_RUNTIME_SERVICES* gRT;
 EFI_BOOT_SERVICES* gBS;
-static EFI_HOB_MEMORY_ALLOCATION_STACK* mStackHob = NULL;
 void* stack_base;
 size_t stack_size;
-void* stack_copy;
 
+static EFI_HOB_MEMORY_ALLOCATION_STACK* mStackHob = NULL;
+static jmp_buf __abort_jmpbuf;
 static void* mHobList = NULL;
 static EFI_GUID gEfiHobListGuid = { 0x7739F24C, 0x93D7, 0x11D4, { 0x9A, 0x3A, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D }};
 static EFI_GUID gEfiHobMemoryAllocStackGuid = { 0x4ED4BF27, 0x4092, 0x42E9, { 0x80, 0x7D, 0x52, 0x7B, 0x1D, 0x00, 0xC9, 0xBD }};
+
+void uefi_do_assert (const char* filename, size_t lineno, const char* exp) {
+    uefi_printf ("UEFI_ASSERT %s(%d): %s\n", filename, lineno, exp);
+    longjmp(__abort_jmpbuf, 1);
+    for(;;);
+}
 
 VOID *
 InternalAllocatePool (
@@ -75,7 +80,9 @@ CompareGuid (
   IN CONST GUID  *Guid2
   )
 {
-  return (memcmp(Guid1, Guid2, sizeof(GUID)) == 0) ? TRUE : FALSE;
+    UEFI_ASSERT(Guid1);
+    UEFI_ASSERT(Guid2);
+    return (memcmp(Guid1, Guid2, sizeof(GUID)) == 0) ? TRUE : FALSE;
 }
 
 EFI_STATUS
@@ -87,6 +94,9 @@ EfiGetSystemConfigurationTable (
 {
   EFI_SYSTEM_TABLE  *SystemTable;
   UINTN             Index;
+
+  UEFI_ASSERT(TableGuid);
+  UEFI_ASSERT(Table);
 
   SystemTable = gST;
   *Table = NULL;
@@ -108,6 +118,8 @@ GetNextHob (
   )
 {
   EFI_PEI_HOB_POINTERS  Hob;
+
+  UEFI_ASSERT(HobStart);
    
   Hob.Raw = (UINT8 *) HobStart;
   //
@@ -159,6 +171,12 @@ _ModuleEntryPoint (
     uefi_init_printf(NULL, internal_putc);
     uefi_printf("entry\n");
 
+    // set abort handler
+    rc = setjmp (__abort_jmpbuf);
+    if (rc) {
+        return EFI_SUCCESS;
+    }
+
     // get hob list
     Status = EfiGetSystemConfigurationTable (&gEfiHobListGuid, &mHobList);
     if(EFI_ERROR(Status)) {
@@ -206,9 +224,9 @@ _ModuleEntryPoint (
     pauxv->a_type = AT_NULL;
 
     // set exit handler
-    rc = setjmp (__exit_jmpbuf);
+    rc = setjmp (rootprocess->return_jmpbuf);
     if (rc) {
-        uefi_printf("exit with %d\n", __exit_code);
+        uefi_printf("exit with %d\n", rootprocess->exit_code);
         return EFI_SUCCESS;
     }
 

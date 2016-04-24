@@ -4,20 +4,8 @@
 #define register_syscall(name) sys_call_table[SYS_##name] = sys_##name;
 
 static void* sys_call_table[MAX_SYSCALL] = {0};
-static int __user* clear_child_tid = NULL;
-static int tid = 1;
-static int pid = 1;
-static int ppid = 0;
-static list_node_t fds;
-static int process_dumpable = 1;
-static long tls = 0;
-static char cwd[PATH_MAX+1] = "/";
-
-// fork
-static jmp_buf vfork_jmpbuf;
-static int in_vfork = 0;
-static int has_vfork_status = 0;
-static int vfork_status;
+static list_node_t processes;
+static process_t* current_process = NULL;
 
 static struct utsname utsname = {
 	.sysname = "UEFI",
@@ -62,13 +50,17 @@ typedef struct {
 
 long sys_close(unsigned int fd);
 static int init_tty(fd_handler_t* fdhandler, int realfd);
+static process_t* create_process(process_t* parent, int pid);
+static void remove_process(process_t* p);
 
 int get_unused_fd(void) {
     unsigned int fd = 0;
 
+    UEFI_ASSERT(current_process);
+
     // get fd handler
     fd_handler_t *entry;
-    list_for_every_entry(&fds, entry, fd_handler_t, node) {
+    list_for_every_entry(&(current_process->fds), entry, fd_handler_t, node) {
         if(entry->fd>=fd) {
             fd = entry->fd+1;
         }
@@ -77,9 +69,25 @@ int get_unused_fd(void) {
     return fd;
 }
 
+int get_unused_pid(void) {
+    unsigned int pid = 0;
+
+    // get fd handler
+    process_t *entry;
+    list_for_every_entry(&processes, entry, process_t, node) {
+        if(entry->pid>=(int)pid) {
+            pid = entry->pid+1;
+        }
+    }
+
+    return pid;
+}
+
 static fd_handler_t* get_file(unsigned int fd) {
+    UEFI_ASSERT(current_process);
+
     fd_handler_t *entry;
-    list_for_every_entry(&fds, entry, fd_handler_t, node) {
+    list_for_every_entry(&(current_process->fds), entry, fd_handler_t, node) {
         if(entry->fd==fd) {
             return entry;
         }
@@ -126,8 +134,13 @@ static ssize_t tty_write(fd_handler_t* fdhandler, char __user * buf, size_t len)
     uint8_t c[4] = {0};
     fd_tty_pdata_t* pdata = fdhandler->private;
 
+    UEFI_ASSERT(pdata);
+
     if(len==0)
         return 0;
+
+    if(!buf)
+        return -EFAULT;
 
     // check if this is stdin
     if(pdata->real_type==0)
@@ -150,8 +163,13 @@ static ssize_t tty_read(unused fd_handler_t* fdhandler, char __user * buf, unuse
     UINTN           WaitIndex;
     EFI_INPUT_KEY   Key;
 
+    UEFI_ASSERT(pdata);
+
     if(len==0)
         return 0;
+
+    if(!buf)
+        return -EFAULT;
 
     // check if this is stdin
     if(pdata->real_type!=0)
@@ -168,7 +186,6 @@ static ssize_t tty_read(unused fd_handler_t* fdhandler, char __user * buf, unuse
         return 0;
     }
 
-
     buf[0] = Key.UnicodeChar;
     if (buf[0] == '\r')
         buf[0] = '\n';
@@ -179,12 +196,16 @@ static ssize_t tty_read(unused fd_handler_t* fdhandler, char __user * buf, unuse
 static long tty_ioctl(fd_handler_t* fdhandler, unsigned int cmd, unsigned long arg) {
     fd_tty_pdata_t* pdata = fdhandler->private;
 
+    UEFI_ASSERT(pdata);
+
     switch(cmd) {
         case TIOCGWINSZ:
+            if(!arg) return -1;
             memcpy((void*)arg, &pdata->winsz, sizeof(struct winsize));
             return 0;
 
         case TIOCSWINSZ:
+            if(!arg) return -1;
             memcpy(&pdata->winsz, (void*)arg, sizeof(struct winsize));
             return 0;
 
@@ -198,34 +219,44 @@ static long tty_ioctl(fd_handler_t* fdhandler, unsigned int cmd, unsigned long a
 }
 
 static void tty_close(fd_handler_t* fdhandler) {
+    UEFI_ASSERT(fdhandler->private);
+
     gBS->FreePool(fdhandler->private);
 }
 
 static int tty_copy(fd_handler_t* dst, fd_handler_t* src) {
+    UEFI_ASSERT(dst);
+    UEFI_ASSERT(src);
+
     init_tty(dst, 0);
+
+    UEFI_ASSERT(dst->private);
+    UEFI_ASSERT(src->private);
+
     memcpy(dst->private, src->private, sizeof(fd_tty_pdata_t));
     return 0;
 }
 
 SYSCALL_DEFINE1(settls, long, val) {
-    tls = val;
+    current_process->tls = val;
     return 0;
 }
 
 SYSCALL_DEFINE0(gettls) {
-    return tls;
+    return current_process->tls;
 }
 
 #define	__W_EXITCODE(ret, sig)	((ret) << 8 | (sig))
 SYSCALL_DEFINE1(exit, int, status) {
-    __exit_code = status;
-    if(in_vfork) {
-        has_vfork_status = 1;
-        vfork_status = __W_EXITCODE(__exit_code, SIGCHLD);
+    UEFI_ASSERT(current_process);
 
-        longjmp_stack (vfork_jmpbuf, 1);
-    } else
-        longjmp (__exit_jmpbuf, 1);
+    current_process->exit_code = status;
+
+    if(current_process->stack_backup) {
+        longjmp_stack (current_process->return_jmpbuf, 1, current_process->stack_backup);
+    } else {
+        longjmp (current_process->return_jmpbuf, 1);
+    }
     return -1;
 }
 
@@ -234,8 +265,10 @@ SYSCALL_DEFINE1(exit_group, int, status) {
 }
 
 SYSCALL_DEFINE1(set_tid_address, int __user *, tidptr) {
-	clear_child_tid = tidptr;
-	return tid;
+    UEFI_ASSERT(current_process);
+
+	current_process->clear_child_tid = tidptr;
+	return current_process->tid;
 }
 
 SYSCALL_DEFINE3(ioctl, unused unsigned int, fd, unused unsigned int, cmd, unused unsigned long, arg) {
@@ -266,6 +299,9 @@ SYSCALL_DEFINE3(writev, unsigned long, fd, struct iovec __user *, vec,
     if(!fdhandler->write) {
         return -EIO;
     }
+
+    if(!vec)
+        return -EFAULT;
     
 	return do_loop_readv_writev(fdhandler, (void*)vec, vlen, fdhandler->write);
 }
@@ -282,6 +318,10 @@ SYSCALL_DEFINE3(write, unsigned int, fd, const char __user *, buf,
         return -EIO;
     }
 
+    if(!buf)
+        return -EFAULT;
+
+    //uefi_printf("%s(%ld, 0x%x, %ld)\n", __func__, fd, buf, count);
 	return fdhandler->write(fdhandler, (void*)buf, count);
 }
 
@@ -296,6 +336,9 @@ SYSCALL_DEFINE3(readv, unsigned long, fd, const struct iovec __user *, vec,
     if(!fdhandler->read) {
         return -EIO;
     }
+
+    if(!vec)
+        return -EFAULT;
     
 	return do_loop_readv_writev(fdhandler, (void*)vec, vlen, fdhandler->read);
 }
@@ -315,11 +358,11 @@ SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
 }
 
 SYSCALL_DEFINE0(getpid) {
-	return pid;
+	return current_process->pid;
 }
 
 SYSCALL_DEFINE0(getppid) {
-	return ppid;
+	return current_process->ppid;
 }
 
 SYSCALL_DEFINE0(getuid) {
@@ -383,6 +426,9 @@ SYSCALL_DEFINE6(mmap2, unsigned long, addr, unsigned long, len,
 
 SYSCALL_DEFINE2(munmap, unsigned long, addr, unused size_t, len)
 {
+    if(!addr)
+        return -EFAULT;
+
 	EFI_STATUS Status = gBS->FreePool((void*)addr);
     if(EFI_ERROR(Status))
         return -1;
@@ -401,17 +447,19 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unused unsigned long, a
 {
     long error;
 
+    UEFI_ASSERT(current_process);
+
 	error = 0;
 	switch (option) {
 		case PR_GET_DUMPABLE:
-			error = process_dumpable;
+			error = current_process->process_dumpable;
 			break;
 		case PR_SET_DUMPABLE:
 			if (arg2 != 0 && arg2 != 1) {
 				error = -EINVAL;
 				break;
 			}
-			process_dumpable = arg2;
+			current_process->process_dumpable = arg2;
 			error = 0;
 			break;
 
@@ -425,11 +473,13 @@ SYSCALL_DEFINE5(prctl, int, option, unsigned long, arg2, unused unsigned long, a
 SYSCALL_DEFINE3(open, unused const char __user *, filename, unused int, flags, unused mode_t, mode)
 {
     //uefi_printf("open(%s, %d, %d)\n", filename, flags, mode);
-	return -1;
+	return -ENOENT;
 }
 
 SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 {
+    UEFI_ASSERT(current_process);
+
 	fd_handler_t *fdhandler_old = get_file(oldfd);
 	fd_handler_t *fdhandler_new = get_file(newfd);
 
@@ -439,16 +489,20 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
 
     // allocate
     fd_handler_t* nfd = AllocateZeroPool(sizeof(fd_handler_t));
-    if(!nfd) return -EIO;
+    if(!nfd) return -ENOMEM;
 
     // copy all data
     memcpy(nfd, fdhandler_old, sizeof(*nfd));
+    nfd->node.magic = 0;
+    nfd->node.next = 0;
+    nfd->node.prev = 0;
+
     // set new fd
     nfd->fd = newfd;
 
     // call dup handler
     if(nfd->copy) {
-        if(nfd->copy(nfd, fdhandler_new)) {
+        if(nfd->copy(nfd, fdhandler_old)) {
             gBS->FreePool(nfd);
             return -EIO;
         }
@@ -464,7 +518,7 @@ SYSCALL_DEFINE2(dup2, unsigned int, oldfd, unsigned int, newfd)
     }
 
     // add new fd to list
-    list_add_tail(&fds, &nfd->node);
+    list_add_tail(&(current_process->fds), &(nfd->node));
 
     return nfd->fd;
 }
@@ -479,18 +533,28 @@ SYSCALL_DEFINE2(getgroups32, int, gidsetsize, unused gid_t __user *, grouplist)
 
 SYSCALL_DEFINE2(getcwd, char __user *, buf, unsigned long, size)
 {
-    if(size<strlen(cwd)+1)
+    UEFI_ASSERT(current_process);
+
+    if(!buf)
+        return -EFAULT;
+
+    if(size<strlen(current_process->cwd)+1)
         return -1;
 
-    strncpy(buf, cwd, size);
+    strncpy(buf, current_process->cwd, size);
     return 0;
 }
 
 SYSCALL_DEFINE1(chdir, const char __user *, filename) {
+    UEFI_ASSERT(current_process);
+
+    if(!filename)
+        return -EFAULT;
+
     if(strlen(filename)>PATH_MAX)
         return -ENAMETOOLONG;
 
-    strncpy(cwd, filename, PATH_MAX);
+    strncpy(current_process->cwd, filename, PATH_MAX);
     return 0;
 }
 
@@ -516,14 +580,17 @@ SYSCALL_DEFINE1(close, unsigned int, fd) {
     if(fdhandler->close)
         fdhandler->close(fdhandler);
 
-    list_remove_tail(&fdhandler->node);
+    list_delete(&(fdhandler->node));
     gBS->FreePool(fdhandler);
 
     return 0;
 }
 
 static int init_tty(fd_handler_t* fdhandler, int realfd) {
+    UEFI_ASSERT(fdhandler);
+
     fd_tty_pdata_t* pdata = AllocateZeroPool(sizeof(fd_tty_pdata_t));
+    UEFI_ASSERT(pdata);
     fdhandler->private = pdata;
 
     pdata->real_type = realfd;
@@ -560,16 +627,43 @@ SYSCALL_DEFINE3(fcntl64, unsigned int, fd, unsigned int, cmd,
 SYSCALL_DEFINE0(vfork) {
     int rc;
 
+    process_t* parent = current_process;
+    UEFI_ASSERT(parent);
+
+    // allocate new process
+    process_t* child = create_process(parent, get_unused_pid());
+    if(!child) {
+        return -ENOMEM;
+    }
+
+    // allocate stack backup
+    child->stack_backup = AllocateZeroPool(stack_size);
+    if(!child->stack_backup) {
+        return -ENOMEM;
+    }
+
     // set exit handler
-    rc = setjmp_stack (vfork_jmpbuf);
+    rc = setjmp_stack (child->return_jmpbuf, child->stack_backup);
+
     if (rc) {
+        UEFI_ASSERT(child);
+        UEFI_ASSERT(parent);
+        UEFI_ASSERT(child!=parent);
+
+        // free stack backup
+        gBS->FreePool(child->stack_backup);
+        child->stack_backup = NULL;
+
+        // remove process
+        remove_process(child);
+
         // parent
-        in_vfork = 0;
-        return 2; // PID:2
+        current_process = parent;
+        return child->pid;
     }
 
     // child
-    in_vfork = 1;
+    current_process = child;
     return 0;
 }
 
@@ -578,11 +672,11 @@ SYSCALL_DEFINE4(wait4, unused pid_t, upid, unused int __user *, stat_addr,
 {
     // XXX: we're ignoring rusage here
 
-    if(has_vfork_status) {
+    /*if(has_vfork_status) {
         has_vfork_status = 0;
         *stat_addr = vfork_status;
         return 2; // PID:2
-    }
+    }*/
 
     return -ECHILD;
 }
@@ -601,7 +695,101 @@ SYSCALL_DEFINE3(execve, const char __user *, path,
     return 0;
 }
 
-void __syscall_init(void) {
+SYSCALL_DEFINE4(rt_sigaction, unused int, sig,
+		unused const struct sigaction __user *, act,
+		unused struct sigaction __user *, oact,
+		unused size_t, sigsetsize)
+{
+    return -1;
+}
+
+SYSCALL_DEFINE4(rt_sigprocmask, unused int, how, unused sigset_t __user *, nset,
+		unused sigset_t __user *, oset, unused size_t, sigsetsize)
+{
+    return -1;
+}
+
+static process_t* create_process(process_t* parent, int pid) {
+    process_t* p = AllocateZeroPool(sizeof(process_t));
+    UEFI_ASSERT(p);
+
+    p->pid = pid;
+    p->tid = pid;
+    p->ppid = parent?parent->pid:0;
+    list_initialize(&(p->fds));
+    p->process_dumpable = 1;
+    snprintf(p->cwd, PATH_MAX, "/");
+
+    if(parent==NULL) {
+        fd_handler_t* fdstdin = AllocateZeroPool(sizeof(fd_handler_t));
+        UEFI_ASSERT(fdstdin);
+        init_tty(fdstdin, 0);
+        fdstdin->fd = 0;
+        list_add_tail(&(p->fds), &(fdstdin->node));
+
+        fd_handler_t* fdstdout = AllocateZeroPool(sizeof(fd_handler_t));
+        UEFI_ASSERT(fdstdout);
+        init_tty(fdstdout, 1);
+        fdstdout->fd = 1;
+        list_add_tail(&(p->fds), &(fdstdout->node));
+
+        fd_handler_t* fdstderr = AllocateZeroPool(sizeof(fd_handler_t));
+        UEFI_ASSERT(fdstderr);
+        init_tty(fdstderr, 2);
+        fdstderr->fd = 2;
+        list_add_tail(&(p->fds), &(fdstderr->node));
+    }
+
+    else {
+        fd_handler_t *entry;
+        list_for_every_entry(&(parent->fds), entry, fd_handler_t, node) {
+
+            // allocate
+            fd_handler_t* nfd = AllocateZeroPool(sizeof(fd_handler_t));
+            UEFI_ASSERT(nfd);
+
+            // copy all data
+            memcpy(nfd, entry, sizeof(*nfd));
+            nfd->node.magic = 0;
+            nfd->node.next = 0;
+            nfd->node.prev = 0;
+
+            // call dup handler
+            if(nfd->copy) {
+                if(nfd->copy(nfd, entry)) {
+                    gBS->FreePool(nfd);
+                    return NULL;
+                }
+            }
+
+            // add new fd to list
+            list_add_tail(&(p->fds), &(nfd->node));
+        }
+    }
+
+    list_add_tail(&processes, &(p->node));
+
+    return p;
+}
+
+static void remove_process(process_t* p) {
+    UEFI_ASSERT(p);
+
+    while(!list_is_empty(&(p->fds))) {
+        fd_handler_t* fdhandler = list_remove_tail_type(&(p->fds), fd_handler_t, node);
+        UEFI_ASSERT(fdhandler);
+
+        if(fdhandler->close) {
+            fdhandler->close(fdhandler);
+        }
+        gBS->FreePool(fdhandler);
+    }
+
+    list_delete(&(p->node));
+    gBS->FreePool(p);
+}
+
+process_t* __syscall_init(void) {
     register_syscall(exit);
     register_syscall(exit_group);
     register_syscall(set_tid_address);
@@ -637,33 +825,24 @@ void __syscall_init(void) {
     register_syscall(wait4);
     register_syscall(poll);
     register_syscall(execve);
-
-    list_initialize(&fds);
-
-    fd_handler_t* fdstdin = AllocateZeroPool(sizeof(fd_handler_t));
-    init_tty(fdstdin, 0);
-    fdstdin->fd = 0;
-    list_add_tail(&fds, &fdstdin->node);
-
-    fd_handler_t* fdstdout = AllocateZeroPool(sizeof(fd_handler_t));
-    init_tty(fdstdout, 1);
-    fdstdout->fd = 1;
-    list_add_tail(&fds, &fdstdout->node);
-
-    fd_handler_t* fdstderr = AllocateZeroPool(sizeof(fd_handler_t));
-    init_tty(fdstderr, 2);
-    fdstderr->fd = 2;
-    list_add_tail(&fds, &fdstderr->node);
+    register_syscall(rt_sigaction);
+    register_syscall(rt_sigprocmask);
 
     snprintf(utsname.release, 65, "v%d.%02d", (gST->Hdr.Revision&0xffff0000)>>16, (gST->Hdr.Revision&0x0000ffff));
     snprintf(utsname.version, 65, "EDK II-0x%08x"/*, gST->FirmwareVendor*/, gST->FirmwareRevision);
+
+    list_initialize(&processes);
+
+    process_t* p = create_process(NULL, 1);
+    current_process = p;
+    return p;
 }
 
 long __syscall(long n, ...) {
     int i;
     long (*fn)(long,...);
 
-    uefi_printf("syscall %d(%x)\n", n, n);
+    //uefi_printf("[%d] syscall %d(%x)\n", current_process->pid, n, n);
 
     // get handler
     if(n==__ARM_NR_set_tls) {
