@@ -26,6 +26,7 @@
 #undef NULL
 
 // STDLIB
+#define _GNU_SOURCE
 #include <sys/statfs.h>
 #include <sys/types.h>
 #include <sys/uio.h>
@@ -35,6 +36,7 @@
 #include <sys/ioctl.h>
 #include <sys/wait.h>
 #include <sys/stat.h>
+#include <sys/mman.h>
 #include <syscall.h>
 #include <stdarg.h>
 #include <setjmp.h>
@@ -46,9 +48,15 @@
 #include <poll.h>
 #include <limits.h>
 #include <malloc.h>
+#include <dirent.h>
 
 #define ROUNDUP(a, b) (((a) + ((b)-1)) & ~((b)-1))
 #define unused __attribute__((unused))
+#define PAGE_ALIGN(addr) ROUNDUP(addr, PAGE_SIZE)
+
+#ifndef PAGE_MASK
+#define PAGE_MASK		(~(PAGE_SIZE-1))
+#endif
 
 void uefi_do_assert (const char* filename, size_t lineno, const char* exp);
 #define _UEFI_ASSERT(Expression)  uefi_do_assert (__FILE__, __LINE__, #Expression)
@@ -88,6 +96,14 @@ typedef struct {
     //int has_vfork_status;
     //int vfork_status;
 } process_t;
+
+struct linux_dirent64 {
+	uint64_t		d_ino;
+	int64_t		d_off;
+	unsigned short	d_reclen;
+	unsigned char	d_type;
+	char		d_name[0];
+};
 
 extern jmp_buf __exit_jmpbuf;
 extern int __exit_code;

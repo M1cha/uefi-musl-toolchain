@@ -52,12 +52,16 @@ struct std_fd {
     list_node_t node;
     unsigned long fd;
     unsigned long flags;
+    unsigned long pos;
     std_file_t* file;
 };
 typedef struct std_fd std_fd_t;
 
 typedef struct {
     int real_type;
+
+    int seqcnt;
+    char escseq[10];
 
     struct winsize winsz;
 } fd_tty_pdata_t;
@@ -80,8 +84,6 @@ static std_file_t* get_file_by_path(const char* path, ssize_t maxlen) {
 
     if(path[0]=='\0')
         return filesystem;
-
-    //uefi_printf("parse: [%s] len=%d\n", path, maxlen);
 
     // we have a path relative to root now
     
@@ -117,6 +119,9 @@ static std_file_t* get_file_by_path(const char* path, ssize_t maxlen) {
                     }
 
                     if(!found_file) return NULL;
+
+                    if(!is_end && !S_ISDIR(file->stat.st_mode))
+                        return NULL;
                 }
             }
 
@@ -127,7 +132,7 @@ static std_file_t* get_file_by_path(const char* path, ssize_t maxlen) {
     return file;
 }
 
-static std_file_t* new_file(const char* path) {
+static std_file_t* new_node(const char* path, mode_t mode) {
     std_file_t* parentfile = NULL;
     char* name = NULL;
 
@@ -176,6 +181,8 @@ static std_file_t* new_file(const char* path) {
         // add file to parent's children
         list_add_tail(&parentfile->children, &(file->node));
     }
+
+    file->stat.st_mode = mode;
 
     return file;
 }
@@ -255,9 +262,17 @@ static ssize_t do_loop_readv_writev(std_file_t *file, struct iovec *iov,
 	return ret;
 }
 
+#define TTY_PRINT_CHAR(c) do { \
+    cu[0] = c; \
+    if(pdata->real_type==2) \
+        gST->StdErr->OutputString(gST->StdErr, (uint16_t*)cu); \
+    else \
+        gST->ConOut->OutputString(gST->ConOut, (uint16_t*)cu); \
+} while(0)
 static ssize_t tty_write(std_file_t* file, char __user * buf, size_t len) {
     size_t i;
-    uint8_t c[4] = {0};
+    int j;
+    uint8_t cu[4] = {0};
     fd_tty_pdata_t* pdata = file->private;
 
     UEFI_ASSERT(pdata);
@@ -273,12 +288,137 @@ static ssize_t tty_write(std_file_t* file, char __user * buf, size_t len) {
         return -EIO;
 
     for(i=0; i<len; i++) {
-        c[0] = buf[i];
+        char c = buf[i];
 
-        if(pdata->real_type==2)
-            gST->StdErr->OutputString(gST->StdErr, (uint16_t*)c);
-        else
-            gST->ConOut->OutputString(gST->ConOut, (uint16_t*)c);
+        // start esc sequence
+        if(c=='\e') {
+            pdata->seqcnt = 0;
+            continue;
+        }
+
+        if(pdata->seqcnt>=0) {
+            // end of sequence
+            if(c=='m') {
+                pdata->escseq[pdata->seqcnt] = 0;
+                char* seq = pdata->escseq+1;
+                int seqlen = pdata->seqcnt-1;
+
+                // get current attributes
+                uint32_t attribute = (uint32_t)gST->ConOut->Mode->Attribute;
+                uint8_t foreground = attribute & 0x07;
+                uint8_t background = ((attribute >> 4) & 0x07);
+                uint8_t brightness = (uint8_t) ((attribute >> 3) & 1);
+
+                // reset
+                if(seqlen==1 && seq[0]=='0') {
+                    foreground = EFI_LIGHTGRAY;
+                    background = EFI_BLACK;
+                    brightness = 0;
+                }
+
+                // background
+                else if(seqlen==2 && seq[0]=='4') {
+                    uint8_t color = seq[1] - '\0';
+                    switch(color) {
+                        case '0':
+                            background = EFI_BLACK;
+                            break;
+                        case '1':
+                            background = EFI_RED;
+                            break;
+                        case '2':
+                            background = EFI_GREEN;
+                            break;
+                        case '3':
+                            background = EFI_BROWN;
+                            break;
+                        case '4':
+                            background = EFI_BLUE;
+                            break;
+                        case '5':
+                            background = EFI_MAGENTA;
+                            break;
+                        case '6':
+                            background = EFI_CYAN;
+                            break;
+                        case '7':
+                            background = EFI_LIGHTGRAY;
+                            break;
+                    }
+                }
+
+                // foreground
+                else if(seqlen==4 && seq[1]==';' && seq[2]=='3') {
+                    char cbrightness = seq[0];
+                    char color = seq[3];
+
+                    // bold
+                    if(cbrightness=='1')
+                        brightness = 1;
+                    // regular
+                    else
+                        brightness = 0;
+
+                    switch(color) {
+                        case '0':
+                            foreground = EFI_BLACK;
+                            break;
+                        case '1':
+                            foreground = EFI_RED;
+                            break;
+                        case '2':
+                            foreground = EFI_GREEN;
+                            break;
+                        case '3':
+                            foreground = EFI_BROWN;
+                            break;
+                        case '4':
+                            foreground = EFI_BLUE;
+                            break;
+                        case '5':
+                            foreground = EFI_MAGENTA;
+                            break;
+                        case '6':
+                            foreground = EFI_CYAN;
+                            break;
+                        case '7':
+                            foreground = EFI_LIGHTGRAY;
+                            break;
+                    }
+                }
+
+                // set new attributes
+                uint32_t nattribute = 0;
+                nattribute |= foreground;
+                nattribute |= background<<4;
+                if(brightness)
+                    nattribute |= 1<<3;
+
+                gST->ConOut->SetAttribute(gST->ConOut, nattribute);
+                pdata->seqcnt = -1;
+                continue;
+            }
+
+            // invalid sequence - print out the buffer
+            if(pdata->seqcnt+1>(int)sizeof(pdata->escseq)-1 || (pdata->seqcnt==0 && c!='[')) {
+
+                TTY_PRINT_CHAR('\e');
+                for(j=0; j<pdata->seqcnt; j++) {
+                    TTY_PRINT_CHAR(pdata->escseq[j]);
+                }
+                TTY_PRINT_CHAR(c);
+
+                pdata->seqcnt = -1;
+                continue;
+            }
+
+            // write sequence character to buffer
+            pdata->escseq[pdata->seqcnt++] = c;
+
+            continue;
+        }
+
+        TTY_PRINT_CHAR(c);
     }
 
     return (ssize_t)len;
@@ -729,6 +869,7 @@ static int init_tty(std_file_t* file, int realfd) {
     file->private = pdata;
 
     pdata->real_type = realfd;
+    pdata->seqcnt = -1;
     pdata->winsz.ws_row = 25;
     pdata->winsz.ws_col = 80;
 
@@ -899,6 +1040,120 @@ static ssize_t null_read(unused std_file_t* file, unused char __user * buf, unus
     return 0;
 }
 
+SYSCALL_DEFINE2(stat64, const char __user *, filename,
+		struct stat __user *, statbuf)
+{
+	UEFI_ASSERT(current_process);
+
+    if(!filename || !statbuf)
+        return -EFAULT;
+
+    // get file
+    std_file_t* file = get_file_by_path(filename, -1);
+    if(!file)
+        return -ENOENT;
+
+    // copy struct data
+    memcpy(statbuf, &file->stat, sizeof(*statbuf));
+
+    // calculate directory size
+    if(S_ISDIR(file->stat.st_mode)) {
+        unsigned int curpos = 0;
+        std_file_t *entry;
+        list_for_every_entry(&file->children, entry, std_file_t, node) {
+            size_t namelen = strlen(entry->name);
+            size_t reclen = ROUNDUP(sizeof(struct linux_dirent64) + namelen+1, sizeof(UINTN));
+
+            curpos += reclen;
+        }
+
+        statbuf->st_size = curpos;
+    }
+
+	return 0;
+}
+
+SYSCALL_DEFINE2(lstat64, const char __user *, filename,
+		struct stat __user *, statbuf)
+{
+	return sys_stat64(filename, statbuf);
+}
+
+SYSCALL_DEFINE3(getdents64, unsigned int, fd,
+		struct linux_dirent64 __user *, dirent, unsigned int, count)
+{
+    std_fd_t *stdfd = get_stdfd(fd);
+    if(!stdfd) {
+        return -EBADF;
+    }
+    std_file_t* file = stdfd->file;
+
+    if(!dirent)
+        return -EFAULT;
+
+    char* buf = (char*)dirent;
+    long bytes_read = -EINVAL;
+    unsigned int curpos = 0;
+    std_file_t *entry;
+    list_for_every_entry(&file->children, entry, std_file_t, node) {
+        size_t namelen = strlen(entry->name);
+        size_t reclen = ROUNDUP(sizeof(*dirent) + namelen+1, sizeof(UINTN));
+
+        // skip entries we've already read/seeked past
+        if(stdfd->pos>=curpos+reclen) {
+            curpos += reclen;
+            continue;
+        }
+
+        // buffer size check
+        if(count<reclen)
+            goto done;
+
+        // write dirent
+        struct linux_dirent64* curdirent = (void*)buf;
+        curdirent->d_ino = 0;
+        curdirent->d_off = bytes_read + reclen;
+        curdirent->d_reclen = reclen;
+        curdirent->d_type = 0;
+        strcpy(curdirent->d_name, entry->name);
+        buf += reclen;
+        count-=reclen;
+
+        // update return value
+        if(bytes_read<0) bytes_read = 0;
+        bytes_read += reclen;
+
+        // advance file position
+        curpos += reclen;
+        stdfd->pos = curpos;
+    }
+
+    if(buf==(char*)dirent)
+        bytes_read = 0;
+
+done:
+    return bytes_read;
+}
+
+SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
+		unsigned long, new_len, unsigned long, flags,
+		unsigned long, new_addr)
+{
+	/* insanity checks first */
+	old_len = PAGE_ALIGN(old_len);
+	new_len = PAGE_ALIGN(new_len);
+	if (old_len == 0 || new_len == 0)
+		return (unsigned long) -EINVAL;
+
+	if (addr & ~PAGE_MASK)
+		return -EINVAL;
+
+	if (flags & MREMAP_FIXED && new_addr != addr)
+		return (unsigned long) -EINVAL;
+
+    return sys_mmap2(addr, new_len, 0, 0, -1, 0);
+}
+
 process_t* __syscall_init(void) {
     register_syscall(exit);
     register_syscall(exit_group);
@@ -939,32 +1194,46 @@ process_t* __syscall_init(void) {
     register_syscall(execve);
     register_syscall(rt_sigaction);
     register_syscall(rt_sigprocmask);
+    register_syscall(stat64);
+    register_syscall(lstat64);
+    register_syscall(getdents64);
+    register_syscall(mremap);
 
     snprintf(utsname.release, 65, "v%d.%02d", (gST->Hdr.Revision&0xffff0000)>>16, (gST->Hdr.Revision&0x0000ffff));
     snprintf(utsname.version, 65, "EDK II-0x%08x"/*, gST->FirmwareVendor*/, gST->FirmwareRevision);
 
     list_initialize(&processes);
-    filesystem = new_file(NULL);
-    filesystem->stat.st_mode = S_IFDIR;
+    filesystem = new_node(NULL, S_IFDIR|S_IRWXU);
+    strcpy(filesystem->name, "/");
 
-    std_file_t* file = new_file("/dev");
+    std_file_t* file = new_node("/dev", S_IFDIR|S_IRWXU);
     UEFI_ASSERT(file);
-    file->stat.st_mode = S_IFDIR;
 
-    file = new_file("/dev/null");
+    file = new_node("/proc", S_IFDIR|S_IRWXU);
+    UEFI_ASSERT(file);
+    file = new_node("/sys", S_IFDIR|S_IRWXU);
+    UEFI_ASSERT(file);
+    file = new_node("/mnt", S_IFDIR|S_IRWXU);
+    UEFI_ASSERT(file);
+    file = new_node("/root", S_IFDIR|S_IRWXU);
+    UEFI_ASSERT(file);
+    file = new_node("/usr", S_IFDIR|S_IRWXU);
+    UEFI_ASSERT(file);
+
+    file = new_node("/dev/null", S_IFCHR|S_IRWXU);
     UEFI_ASSERT(file);
     file->read = null_read;
     file->write = null_write;
 
-    std_file_t* fstdin = new_file("/dev/stdin");
+    std_file_t* fstdin = new_node("/dev/stdin", S_IFCHR|S_IRWXU);
     UEFI_ASSERT(fstdin);
     init_tty(fstdin, 0);
 
-    std_file_t* fstdout = new_file("/dev/stdout");
+    std_file_t* fstdout = new_node("/dev/stdout", S_IFCHR|S_IRWXU);
     UEFI_ASSERT(fstdout);
     init_tty(fstdout, 1);
 
-    std_file_t* fstderr = new_file("/dev/stderr");
+    std_file_t* fstderr = new_node("/dev/stderr", S_IFCHR|S_IRWXU);
     UEFI_ASSERT(fstderr);
     init_tty(fstderr, 2);
 
