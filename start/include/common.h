@@ -22,6 +22,7 @@
 #include <Uefi.h>
 #include <PiDxe.h>
 #include <Library/HobLib.h>
+#include <Protocol/LoadedImage.h>
 #undef NULL
 
 // STDLIB
