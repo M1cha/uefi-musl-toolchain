@@ -1151,7 +1151,13 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
 	if (flags & MREMAP_FIXED && new_addr != addr)
 		return (unsigned long) -EINVAL;
 
-    return sys_mmap2(addr, new_len, 0, 0, -1, 0);
+    long rc = sys_mmap2(addr, new_len, 0, 0, -1, 0);
+    if(rc>=0) {
+        memcpy((void*)rc, (void*)addr, old_len);
+        sys_munmap(addr, old_len);
+    }
+
+    return rc;
 }
 
 process_t* __syscall_init(void) {
