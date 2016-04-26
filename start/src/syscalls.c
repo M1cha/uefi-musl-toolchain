@@ -418,6 +418,9 @@ static ssize_t tty_write(std_file_t* file, char __user * buf, size_t len) {
             continue;
         }
 
+        if(c=='\n')
+            TTY_PRINT_CHAR('\r');
+
         TTY_PRINT_CHAR(c);
     }
 

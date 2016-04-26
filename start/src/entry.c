@@ -99,6 +99,11 @@ AllocateCopyPool (
 static void internal_putc (unused void* p, char c) {
     uint8_t buf[4] = {0};
 
+    if(c=='\n') {
+        buf[0] = '\r';
+        gST->ConOut->OutputString(gST->ConOut, (uint16_t*)buf);
+    }
+
     buf[0] = c;
     gST->ConOut->OutputString(gST->ConOut, (uint16_t*)buf);
 }
